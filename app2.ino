@@ -1,0 +1,130 @@
+#include <ESP32Servo.h>
+
+#define NUM_MOTORS       4
+#define HEADER_BYTE      0xAA
+#define FOOTER_BYTE      0x55
+#define FAILSAFE_TIMEOUT 1000 
+
+#define IDLE_PULSE       1000 
+#define MIN_THROTTLE     1140 
+#define MAX_THROTTLE     2000
+
+const int ESC_PINS[NUM_MOTORS] = {18, 19, 21, 22};
+
+Servo esc[NUM_MOTORS];
+
+int targetPulseWidth[NUM_MOTORS]  = {IDLE_PULSE, IDLE_PULSE, IDLE_PULSE, IDLE_PULSE};
+int currentPulseWidth[NUM_MOTORS] = {IDLE_PULSE, IDLE_PULSE, IDLE_PULSE, IDLE_PULSE};
+
+unsigned long lastRampTime     = 0;
+unsigned long lastResponseTime = 0;
+unsigned long lastPacketTime   = 0;
+
+int calculateExpoPulse(uint8_t pwm_in) {
+    if (pwm_in == 0) return IDLE_PULSE;
+
+    float input = (float)pwm_in / 255.0f; 
+    float a = 0.35f; 
+    
+    float output = a * (input * input * input) + (1.0f - a) * input;
+
+    return MIN_THROTTLE + (int)(output * (MAX_THROTTLE - MIN_THROTTLE));
+}
+
+void processSerial() {
+    static uint8_t buffer[8];
+    static uint8_t index = 0;
+
+    while (Serial.available() > 0) {
+        uint8_t inByte = Serial.read();
+
+        if (index == 0 && inByte != HEADER_BYTE) continue;
+
+        buffer[index++] = inByte;
+
+        if (index == 8) {
+            if (buffer[7] == FOOTER_BYTE) {
+                uint8_t m1_pwm    = buffer[1];
+                uint8_t m2_pwm    = buffer[2];
+                uint8_t m3_pwm    = buffer[3];
+                uint8_t m4_pwm    = buffer[4];
+                uint8_t dir_flags = buffer[5];
+                uint8_t checksum  = buffer[6];
+
+                uint8_t calc_checksum = (m1_pwm + m2_pwm + m3_pwm + m4_pwm + dir_flags) & 0xFF;
+
+                if (checksum == calc_checksum) {
+                    lastPacketTime = millis(); 
+
+                    targetPulseWidth[0] = calculateExpoPulse(m1_pwm);
+                    targetPulseWidth[1] = calculateExpoPulse(m2_pwm);
+                    targetPulseWidth[2] = calculateExpoPulse(m3_pwm);
+                    targetPulseWidth[3] = calculateExpoPulse(m4_pwm);
+
+                    if (millis() - lastResponseTime >= 100) {
+                        Serial.println("OK");
+                        lastResponseTime = millis();
+                    }
+                }
+            }
+            index = 0; 
+        }
+    }
+}
+
+void updateESCSmoothly() {
+    if (millis() - lastRampTime >= 2) { 
+        lastRampTime = millis();
+
+        for (int i = 0; i < NUM_MOTORS; i++) {
+            int diff = targetPulseWidth[i] - currentPulseWidth[i];
+
+            if (diff > 0) {
+                if (currentPulseWidth[i] < MIN_THROTTLE && targetPulseWidth[i] >= MIN_THROTTLE) {
+                    currentPulseWidth[i] = MIN_THROTTLE;
+                } else {
+                    int step = (currentPulseWidth[i] < 1400) ? 1 : 3;
+                    currentPulseWidth[i] += step;
+                    if (currentPulseWidth[i] > targetPulseWidth[i]) currentPulseWidth[i] = targetPulseWidth[i];
+                }
+            } 
+            else if (diff < 0) {
+                currentPulseWidth[i] -= 4; 
+                if (currentPulseWidth[i] < targetPulseWidth[i]) currentPulseWidth[i] = targetPulseWidth[i];
+            }
+
+            esc[i].writeMicroseconds(currentPulseWidth[i]);
+        }
+    }
+}
+
+void checkFailsafe() {
+    if (millis() - lastPacketTime > FAILSAFE_TIMEOUT) {
+        for (int i = 0; i < NUM_MOTORS; i++) {
+            targetPulseWidth[i] = IDLE_PULSE;
+        }
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Serial.setRxBufferSize(1024);
+
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+
+    for (int i = 0; i < NUM_MOTORS; i++) {
+        esc[i].setPeriodHertz(50); 
+        esc[i].attach(ESC_PINS[i], IDLE_PULSE, MAX_THROTTLE);
+        esc[i].writeMicroseconds(IDLE_PULSE); 
+    }
+
+    lastPacketTime = millis();
+    delay(3000); 
+}
+
+void loop() {
+    processSerial();       
+    checkFailsafe();       
+    updateESCSmoothly();   
+}
